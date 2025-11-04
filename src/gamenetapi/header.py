@@ -11,6 +11,7 @@ HEADER_SIZE = 1 + 3 + 4  # 8 bytes total
 class ChannelType(IntEnum):
     UNRELIABLE = 0
     RELIABLE = 1
+    ACK  = 2
 
 @dataclass
 class HudpMessage:
@@ -44,7 +45,7 @@ def _decode_header(data: bytes) -> Tuple[ChannelType, int, int, bytes]:
     if len(data) < HEADER_SIZE:
         raise ValueError(f"Datagram too short for header: {len(data)} < {HEADER_SIZE}")
     channel = data[0]
-    if channel != ChannelType.UNRELIABLE and channel != ChannelType.RELIABLE:
+    if channel != ChannelType.UNRELIABLE and channel != ChannelType.RELIABLE and channel != ChannelType.ACK:
         raise ValueError(f"Invalid channel: {channel}")
     seq = _unpack_u24_be(data[1:4])
     ts = int.from_bytes(data[4:8], "big", signed=False)
