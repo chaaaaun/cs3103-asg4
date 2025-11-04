@@ -12,7 +12,8 @@ async def run_server():
             print(f"Server got ch={msg.channel} seq={msg.seq} ts={msg.ts} payload={msg.payload!r} from {msg.addr}")
 
             # echo back using same sequence number
-            udp.send_message(msg.channel, msg.seq, int(time.time()), msg.payload, addr=msg.addr)
+            if msg.payload == b'':
+                udp.send_message(msg.channel, msg.seq, int(time.time()), msg.payload, addr=msg.addr)
 
     finally:
         udp.close()

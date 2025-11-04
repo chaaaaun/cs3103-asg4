@@ -8,9 +8,9 @@ from gamenetapi.header import (
     _encode_header, _decode_header, HudpMessage, ChannelType, Addr, BytesLike
 )
 
-PACKET_TIMEOUT_MS = 200.0
-GIVEUP_TIMEOUT_MS = 2000.0
-WINDOW_SIZE = 16
+PACKET_TIMEOUT_MS = 50
+GIVEUP_TIMEOUT_MS = 200.0
+WINDOW_SIZE = 5
 MAX_SEQ = 65536
 
 class _UDPProtocol(asyncio.DatagramProtocol):
