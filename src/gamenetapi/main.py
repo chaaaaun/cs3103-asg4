@@ -1,12 +1,11 @@
 import asyncio
 import socket
 import time
-from typing import Optional, Tuple, Union, Dict, Any
 from collections import defaultdict
-from dataclasses import dataclass
+from typing import Optional, Tuple, Union, Dict, Any
 
 from gamenetapi.header import (
-    _encode_header, _decode_header, HudpMessage, ChannelType, HEADER_SIZE, Addr, BytesLike
+    _encode_header, _decode_header, HudpMessage, ChannelType, Addr, BytesLike
 )
 
 PACKET_TIMEOUT_MS = 200.0
@@ -35,9 +34,7 @@ class _UDPProtocol(asyncio.DatagramProtocol):
 
 
 class HUDP:
-    def __init__(self, is_server: bool):
-        self.is_server = is_server
-
+    def __init__(self):
         self._recv_queue: asyncio.Queue = asyncio.Queue()
         self._app_queue: asyncio.Queue = asyncio.Queue()
         self._transport: Optional[asyncio.DatagramTransport] = None
@@ -196,8 +193,7 @@ class HUDP:
                                 break
 
                 elif channel == ChannelType.RELIABLE:
-                    if self.is_server:
-                        self.send_message(ChannelType.ACK, seq, time.time(), b'', addr)
+                    self.send_message(ChannelType.ACK, seq, time.time(), b'', addr)
 
                     base = self.recv_base[addr]
                     if not self._in_window(seq, base, WINDOW_SIZE):

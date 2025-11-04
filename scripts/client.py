@@ -7,7 +7,7 @@ from gamenetapi import HUDP, ChannelType
 RELIABILITY_RATIO = 1.0
 
 async def run_client():
-    udp = await HUDP(is_server=False).start(remote_addr=("127.0.0.1", 9999))
+    udp = await HUDP().start(remote_addr=("127.0.0.1", 9999))
 
     reliable_seq = 0
     unreliable_seq = 0

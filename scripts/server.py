@@ -3,7 +3,7 @@ import time
 from gamenetapi import HUDP, ChannelType
 
 async def run_server():
-    udp = await HUDP(is_server=True).start(local_addr=("127.0.0.1", 9999))
+    udp = await HUDP().start(local_addr=("127.0.0.1", 9999))
     print("Server started.")
 
     try:
