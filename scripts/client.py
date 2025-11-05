@@ -1,12 +1,68 @@
 import asyncio
 import time
 import random
-
 from gamenetapi import HUDP, ChannelType
 
 RELIABILITY_RATIO = 0.5
 WINDOW_SIZE = 5
 SEND_INTERVAL = 0.1
+DELAY_MEAN = 0.05           
+DELAY_JITTER = 0.02          # ±20 ms jitter
+PACKET_LOSS_RATE = 0.1
+RETRANSMIT_TIMEOUT = 1.0     # Retransmit after 1 second if no ACK
+
+async def delayed_send(udp, addr, channel, seq, ts, payload):
+    """Simulate network delay and packet loss"""
+    # Simulate network delay
+    network_delay = max(0, random.gauss(DELAY_MEAN, DELAY_JITTER))
+    await asyncio.sleep(network_delay)
+    
+    # Simulate packet loss
+    if random.random() < PACKET_LOSS_RATE:
+        print(f"[DROP] {channel} seq={seq}")
+        return False  # Packet dropped
+    else:
+        udp.send_message(channel, seq, ts, payload, addr)
+        return True  # Packet sent
+
+async def send_reliable_with_retry(udp, addr, seq, payload, max_retries=5):
+    """Send reliable message with automatic retransmission on timeout"""
+    retries = 0
+    
+    while retries < max_retries:
+        ts = int(time.time())
+        
+        # Send with delay and potential drop
+        sent = await delayed_send(udp, addr, ChannelType.RELIABLE, seq, ts, payload)
+        
+        if sent:
+            print(f"[CLIENT SEND] REL seq={seq} (attempt {retries + 1})")
+        else:
+            print(f"[CLIENT SEND] REL seq={seq} (attempt {retries + 1}) - DROPPED, will retry")
+        
+        # Wait for ACK with timeout
+        try:
+            # Check if we got an ACK within timeout period
+            # This assumes the HUDP implementation handles ACKs internally
+            # and removes from send_window when ACK received
+            start_time = time.time()
+            while time.time() - start_time < RETRANSMIT_TIMEOUT:
+                # Check if message is still in send window (not ACKed)
+                if (addr, seq) not in udp.send_window:
+                    print(f"[CLIENT ACK] REL seq={seq} acknowledged")
+                    return True  # Successfully delivered
+                await asyncio.sleep(0.01)
+            
+            # Timeout - no ACK received
+            print(f"[CLIENT TIMEOUT] REL seq={seq} - retransmitting")
+            retries += 1
+            
+        except Exception as e:
+            print(f"[CLIENT ERROR] seq={seq}: {e}")
+            retries += 1
+    
+    print(f"[CLIENT FAILED] REL seq={seq} - max retries reached")
+    return False
 
 async def run_client():
     addr = ("127.0.0.1", 9999)
@@ -15,40 +71,49 @@ async def run_client():
     # Client maintains its own sequence numbers
     reliable_seq = 0
     unreliable_seq = 0
+    
     try:
-        # Create separate tasks for sending and receiving
         async def send_loop():
             nonlocal reliable_seq, unreliable_seq
             while True:
                 is_reliable = random.random() < RELIABILITY_RATIO
+                
                 if is_reliable:
                     # Check window availability (only for reliable)
                     active_reliable = sum(1 for (a, _) in udp.send_window.keys() if a == addr)
                     
                     if active_reliable >= WINDOW_SIZE:
-                        print(f"[CLIENT] Window full")
+                        print(f"[CLIENT] Window full ({active_reliable}/{WINDOW_SIZE})")
                         await asyncio.sleep(0.1)
                         continue
-
-                    ts = int(time.time())
-                    seq_used = udp.send_message(ChannelType.RELIABLE, reliable_seq, ts=ts, payload="hello", addr=addr)
+                    
+                    # Send reliable message with retry logic
+                    asyncio.create_task(send_reliable_with_retry(udp, addr, reliable_seq, "hello"))
                     reliable_seq += 1
-                    print(f"[CLIENT SEND] {'REL'} seq={seq_used}")
-
+                    
                 else:
+                    #continue # for testing of ONLY reliable
+                    # Unreliable messages - send once with delay/drop, no retry
                     ts = int(time.time())
-                    seq_used = udp.send_message(ChannelType.UNRELIABLE, unreliable_seq, ts=ts, payload="hello", addr=addr)
+                    sent = await delayed_send(udp, addr, ChannelType.UNRELIABLE, unreliable_seq, ts, "hello")
+                    
+                    if sent:
+                        print(f"[CLIENT SEND] UNREL seq={unreliable_seq}")
+                    else:
+                        print(f"[CLIENT SEND] UNREL seq={unreliable_seq} - DROPPED (no retry)")
+                    
                     unreliable_seq += 1
-                    print(f"[CLIENT SEND] {'UNREL'} seq={seq_used}")
+                
+                await asyncio.sleep(SEND_INTERVAL)
         
         async def recv_loop():
             while True:
                 try:
                     msg = await asyncio.wait_for(udp.recv_message(), timeout=0.1)
-                    print(f"Client got ch={msg.channel} seq={msg.seq} ts={msg.ts} payload={msg.payload!r} from {msg.addr}")
+                    print(f"[CLIENT RECV] ch={msg.channel} seq={msg.seq} ts={msg.ts} payload={msg.payload!r} from {msg.addr}")
                 except asyncio.TimeoutError:
                     continue
-
+        
         # Run both loops concurrently
         send_task = asyncio.create_task(send_loop())
         recv_task = asyncio.create_task(recv_loop())
