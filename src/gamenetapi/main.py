@@ -80,7 +80,7 @@ class HUDP:
         self.send_window.clear()
 
     def _get_timestamp_ms(self) -> int:
-        return int(time.time() * 1000) % (2**32)
+        return int(time.monotonic() * 1000) % (2**32)
 
     def _in_window(self, seq: int, base: int, size: int) -> bool:
         return ((seq - base) % MAX_SEQ) < size
@@ -120,8 +120,8 @@ class HUDP:
             key = (addr, seq)
             self.send_window[key] = {
                 'packet': packet,
-                'first_sent': time.time(),
-                'last_sent': time.time(),
+                'first_sent': self._get_timestamp_ms(),
+                'last_sent': self._get_timestamp_ms(),
                 'retries': 0,
                 'timer': asyncio.create_task(self._retransmit_timer(addr, seq))
             }
@@ -141,7 +141,7 @@ class HUDP:
             if key not in self.send_window:
                 break
             entry = self.send_window[key]
-            elapsed = (time.time() - entry['first_sent']) * 1000
+            elapsed = ((time.monotonic() - entry['first_sent']) * 1000) % (2**32)
 
             # If elapsed time exceeds max time allowed, skip the packet.
             if elapsed >= GIVEUP_TIMEOUT_MS:
@@ -149,7 +149,7 @@ class HUDP:
                 del self.send_window[key]
                 break
             self.send_raw(entry['packet'], addr)
-            entry['last_sent'] = time.time()
+            entry['last_sent'] = self._get_timestamp_ms()
             entry['retries'] += 1
             print(f"[RETRANSMIT] seq={seq} to {addr} (retry #{entry['retries']})")
 
@@ -172,12 +172,13 @@ class HUDP:
                     print(f"[RECV UNREL] seq={seq} from {addr}")
 
                 # ACK messages: cancel retransmit timers
+                # Only client will run this elif.
                 elif channel == ChannelType.ACK:
                     key = (addr, seq)
                     if key in self.send_window:
                         entry = self.send_window[key]
                         if entry['retries'] == 0:
-                            rtt = (time.time() - entry['first_sent']) * 1000
+                            rtt = ((time.monotonic() - entry['first_sent']) * 1000) % (2**32)
                             print(f"[RECV ACK] seq={seq} from {addr}, RTT={rtt:.1f}ms")
                         else:
                             print(f"[RECV ACK] seq={seq} from {addr} (retransmitted)")
@@ -193,7 +194,7 @@ class HUDP:
                                 break
 
                 elif channel == ChannelType.RELIABLE:
-                    self.send_message(ChannelType.ACK, seq, time.time(), b'', addr)
+                    self.send_message(ChannelType.ACK, seq, self._get_timestamp_ms(), b'', addr)
 
                     base = self.recv_base[addr]
                     if not self._in_window(seq, base, WINDOW_SIZE):
@@ -207,7 +208,7 @@ class HUDP:
                         print(f"[RECV REL] seq={seq} from {addr} (duplicate)")
                     else:
                         msg = HudpMessage(channel, seq, ts, payload, addr)
-                        msg.arrival_time = time.time()
+                        msg.arrival_time = self._get_timestamp_ms()
                         self.recv_window[addr][seq] = msg
                         print(f"[RECV REL] seq={seq} from {addr} (buffered, expecting {base})")
                         await self._check_timeout_gaps(addr)
@@ -237,16 +238,24 @@ class HUDP:
         window = self.recv_window[addr]
         if not window:
             return
-        for seq in sorted(window.keys()):
-            if seq > base:
-                msg = window[seq]
-                if hasattr(msg, "arrival_time"):
-                    elapsed = (time.time() - msg.arrival_time) * 1000
-                    if elapsed >= GIVEUP_TIMEOUT_MS:
-                        print(f"[TIMEOUT] Skipping gap from seq={base} to seq={seq} after {elapsed:.0f}ms")
-                        self.recv_base[addr] = (seq + 1) % MAX_SEQ
-                        window.pop(seq)
-                        await self._app_queue.put(msg)
-                        base = self.recv_base[addr]
-                    else:
-                        break
+
+        ahead = [s for s in window.keys() if s > base]
+        if not ahead:
+            return
+        
+        earliest = min(ahead)
+        msg = window.get(earliest)
+        if msg is None:
+            return
+        
+        arrival = getattr(msg, "arrival_time", None)
+        if arrival is None:
+            return
+        waited_ms = (time.monotonic() - arrival) * 1000.0
+
+        if waited_ms >= GIVEUP_TIMEOUT_MS:
+            print(f"[TIMEOUT] Skipping gap from seq={base} to seq={earliest} after {waited_ms:.0f}ms")
+            # Advance base to the earliest buffered seq we decided to accept,
+            # then deliver that and any contiguous buffered packets immediately.
+            self.recv_base[addr] = earliest
+            await self._deliver_buffered(addr)
