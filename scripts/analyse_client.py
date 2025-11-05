@@ -1,6 +1,10 @@
 # scripts/analyze_client.py
-import argparse, asyncio, csv, os, socket, struct, time
+import argparse, asyncio, csv, os, socket, struct, time, random
 from typing import Optional
+
+DELAY_MEAN = 0.05           
+DELAY_JITTER = 0.02          # ±20 ms jitter
+PACKET_LOSS_RATE = 0.1
 
 # Try to import HUDP only if used
 try:
@@ -47,6 +51,20 @@ def unpack_payload(b: bytes):
     user = b[11:]
     return seq, send_ms, user
 
+async def delays_and_drop(udp, payload, seq, payload_len):
+    # Simulate network delay (used to represent latency)
+        network_delay = max(0, random.gauss(DELAY_MEAN, DELAY_JITTER))
+        await asyncio.sleep(network_delay)
+
+        # Simulating packet loss
+        if random.random() < PACKET_LOSS_RATE:
+            print(f"[DROP] message")
+            # packet lost
+        else:
+            payload = pack_payload(seq & 0xFFFFFF, now_ms(), os.urandom(payload_len))
+            udp.send_message(ChannelType.UNRELIABLE, seq & 0xFFFFFF, int(time.time()), payload)
+
+
 async def run_hudp(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
     assert HUDP is not None, "gamenetapi not available"
     udp = await HUDP().start(remote_addr=(addr, port))
@@ -66,7 +84,7 @@ async def run_hudp(addr: str, port: int, pps: int, duration_s: int, payload_len:
         while time.time() < t_end:
             # send one packet
             payload = pack_payload(seq & 0xFFFFFF, now_ms(), os.urandom(payload_len))
-            udp.send_message(ChannelType.UNRELIABLE, seq & 0xFFFFFF, int(time.time()), payload)
+            asyncio.create_task(delays_and_drop(udp, payload, seq, payload_len))
             sent += 1
 
             # try to receive one (echo)
