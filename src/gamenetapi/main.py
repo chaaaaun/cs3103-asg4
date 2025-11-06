@@ -182,7 +182,7 @@ class HUDP:
         self.send_raw(packet, addr)
 
         if channel == ChannelType.UNRELIABLE:
-            print(f"[SEND UNREL] seq={seq} to {addr}")
+            print(f"[SEND UNRELIABLE] SeqNo={seq}, Timestamp={ts} to {addr}")
         elif channel == ChannelType.RELIABLE and not ack:
             key = (addr, seq)
             self.send_window[key] = {
@@ -192,9 +192,9 @@ class HUDP:
                 'retries': 0,
                 'timer': asyncio.create_task(self._retransmit_timer(addr, seq))
             }
-            print(f"[SEND REL] seq={seq} to {addr}")
+            print(f"[SEND RELIABLE] SeqNo={seq}, Timestamp={ts} to {addr}")
         elif channel == ChannelType.RELIABLE and ack:
-            print(f"[SEND ACK] seq={seq} to {addr}")
+            print(f"[SEND ACK] SeqNo={seq}, Timestamp={ts} to {addr}")
 
         return seq
 
@@ -212,14 +212,14 @@ class HUDP:
 
             # If elapsed time exceeds max time allowed, skip the packet.
             if elapsed >= GIVEUP_TIMEOUT_MS:
-                print(f"[GIVEUP] seq={seq} to {addr} after {elapsed:.0f}ms")
+                print(f"[GIVEUP] SeqNo={seq}, Timestamp={ts} to {addr} after {elapsed:.0f}ms")
                 del self.send_window[key]
                 self._get_win_event(addr).set()  # free a slot
                 break
             self.send_raw(entry['packet'], addr)
             entry['last_sent'] = time.monotonic()
             entry['retries'] += 1
-            print(f"[RETRANSMIT] seq={seq} to {addr} (retry #{entry['retries']})")
+            print(f"[SEND RETRANSMIT] SeqNo={seq}, Timestamp={ts}, Retransmission #{entry['retries']} to {addr}")
 
     async def recv_message(self) -> HudpMessage:
         msg = await self._app_queue.get()
@@ -241,7 +241,7 @@ class HUDP:
                 # Deliver unreliable packets immediately, no need sequence number also actually.
                 if channel == ChannelType.UNRELIABLE:
                     await self._app_queue.put(msg)
-                    print(f"[RECV UNREL] seq={seq} from {addr}")
+                    print(f"[RECIEVE UNRELIABLE] SeqNo={seq}, Timestamp={ts} from {addr}")
 
                 # ACK messages: cancel retransmit timers
                 elif channel == ChannelType.RELIABLE and ack:
@@ -250,9 +250,10 @@ class HUDP:
                         entry = self.send_window[key]
                         if entry['retries'] == 0:
                             rtt = (time.monotonic() - entry['first_sent']) * 1000
-                            print(f"[RECV ACK] seq={seq} from {addr}, RTT={rtt:.1f}ms")
+                            print(f"[RECIEVE ACK] SeqNo={seq}, Timestamp={ts}, RTT={rtt:.1f}ms from {addr}")
                         else:
-                            print(f"[RECV ACK] seq={seq} from {addr} (retransmitted)")
+                            rtt = (time.monotonic() - entry['last_sent']) * 1000
+                            print(f"[RECIEVE ACK] SeqNo={seq}, Timestamp={ts}, Retransmission #{entry['retries']}, RTT={rtt:.1f}ms from {addr}")
                         entry['timer'].cancel()
                         # ACK packet received for seq number so remove from send_window
                         del self.send_window[key]
@@ -272,7 +273,7 @@ class HUDP:
                     # Duplicate older than base -> re-ACK and discard
                     if seq < base:
                         self.send_message(ChannelType.RELIABLE, True, seq, b'', addr)
-                        print(f"[RECV REL] seq={seq} from {addr} (duplicate < base), reACK")
+                        print(f"[RECIEVE RELIABLE] SeqNo={seq}, Timestamp={ts} from {addr} (duplicate)")
                         continue
 
                     # Before processing, see if the current head-of-line gap has aged out
@@ -280,7 +281,7 @@ class HUDP:
                     base = self.recv_base[addr]
 
                     if not self._in_window(seq, base, WINDOW_SIZE):
-                        print(f"[RECV REL] seq={seq} from {addr} outside window [base={base}]")
+                        print(f"[RECIEVE RELIABLE] SeqNo={seq}, Timestamp={ts} from {addr} [expecting SeqNo={base}]")
                         continue
 
                     # SR: ACK on receipt (even if buffered)
@@ -291,12 +292,12 @@ class HUDP:
                         await self._deliver_buffered(addr)
                         self.gap_start[addr] = None
                     elif seq in self.recv_window[addr]:
-                        print(f"[RECV REL] seq={seq} from {addr} (duplicate)")
+                        print(f"[RECIEVE RELIABLE] SeqNo={seq}, Timestamp={ts} from {addr} (duplicate)")
                     else:
                         msg = HudpMessage(channel, ack, seq, ts, payload, addr)
                         msg.arrival_time = time.monotonic()  # harmless with gap-age logic
                         self.recv_window[addr][seq] = msg
-                        print(f"[RECV REL] seq={seq} from {addr} (buffered, expecting {base})")
+                        print(f"[RECIEVE RELIABLE] SeqNo={seq}, Timestamp={ts} (buffered, expecting SeqNo={base})")
                         if self.gap_start[addr] is None:
                             self.gap_start[addr] = time.monotonic()
 
@@ -331,7 +332,7 @@ class HUDP:
             # nothing available; minimally move base by one to avoid permanent stall
             jump_to = (base + 1) % MAX_SEQ
 
-        print(f"[TIMEOUT] Skipping missing seq={base} after {waited_ms:.0f}ms")
+        print(f"[PACKET TIMEOUT] Skipping missing SeqNo={seq}, Timestamp={ts} after {waited_ms:.0f}ms")
         self.recv_base[addr] = jump_to
         self.gap_start[addr] = None
         await self._deliver_buffered(addr)
@@ -339,7 +340,7 @@ class HUDP:
     async def _deliver_in_order(self, addr: Addr, seq: int, ts: int, payload: bytes):
         msg = HudpMessage(ChannelType.RELIABLE, False, seq, ts, payload, addr)
         await self._app_queue.put(msg)
-        print(f"[RECV REL] seq={seq} from {addr} (in-order)")
+        print(f"[RECIEVE RELIABLE] SeqNo={seq}, Timestamp={ts} from {addr} (in-order delivery)")
         self.recv_base[addr] = (self.recv_base[addr] + 1) % MAX_SEQ
 
     async def _deliver_buffered(self, addr: Addr):
@@ -347,7 +348,7 @@ class HUDP:
         while base in self.recv_window[addr]:
             msg = self.recv_window[addr].pop(base)
             await self._app_queue.put(msg)
-            print(f"[RECV REL] seq={msg.seq} from {addr} (from buffer)")
+            print(f"[RECIEVE RELIABLE] SeqNo={msg.seq}, Timestamp={ts} from {addr} (from buffer)")
             base = (base + 1) % MAX_SEQ
             self.recv_base[addr] = base
 
