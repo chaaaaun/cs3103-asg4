@@ -51,6 +51,8 @@ class HUDP:
 
         self._remote_addr: Optional[Addr] = None
 
+        self._sw_lock = asyncio.Lock()
+
     async def start(self, local_addr: Optional[Addr] = None, remote_addr: Optional[Addr] = None) -> "HUDP":
         loop = asyncio.get_running_loop()
         transport, protocol = await loop.create_datagram_endpoint(
@@ -120,8 +122,8 @@ class HUDP:
             key = (addr, seq)
             self.send_window[key] = {
                 'packet': packet,
-                'first_sent': self._get_timestamp_ms(),
-                'last_sent': self._get_timestamp_ms(),
+                'first_sent': time.monotonic(),
+                'last_sent': time.monotonic(),
                 'retries': 0,
                 'timer': asyncio.create_task(self._retransmit_timer(addr, seq))
             }
