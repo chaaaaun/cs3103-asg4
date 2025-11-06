@@ -1,9 +1,13 @@
 import asyncio
+import os
+import socket
+import struct
 import time
 import random
 from gamenetapi import HUDP, ChannelType
+from typing import Tuple
 
-RELIABILITY_RATIO = 0.5
+RELIABILITY_RATIO = 0
 WINDOW_SIZE = 5
 SEND_INTERVAL = 0.1
 DELAY_MEAN = 0.05           
@@ -11,19 +15,26 @@ DELAY_JITTER = 0.02          # ±20 ms jitter
 PACKET_LOSS_RATE = 0.1
 RETRANSMIT_TIMEOUT = 1.0     # Retransmit after 1 second if no ACK
 
-async def delayed_send(udp, addr, channel, seq, ts, payload):
-    """Simulate network delay and packet loss"""
-    # Simulate network delay
-    network_delay = max(0, random.gauss(DELAY_MEAN, DELAY_JITTER))
-    await asyncio.sleep(network_delay)
-    
-    # Simulate packet loss
-    if random.random() < PACKET_LOSS_RATE:
-        print(f"[DROP] {channel} seq={seq}")
-        return False  # Packet dropped
-    else:
-        udp.send_message(channel, seq, ts, payload, addr)
-        return True  # Packet sent
+# Collect metrics on the server side
+async def send_udp(target: Tuple[str, int], sock: socket.socket, pps: int, duration_s: int, payload_len: int):
+    sock.settimeout(max(0.001, 1.0/pps))
+
+    seq = 0
+    interval = 1.0 / max(1, pps)
+
+    loop = asyncio.get_running_loop()
+    next_time = loop.time()
+    end_time = loop.time() + duration_s
+
+    while loop.time() < end_time:
+        next_time += interval
+        pkt = (seq & 0xFFFFFF).to_bytes(3, "big", signed=False) + struct.pack(">Q", int(time.time() * 1000)) + os.urandom(payload_len)
+        sock.sendto(pkt, target)
+
+        seq += 1
+
+        print("[UDP] Sent packet with seq", seq)
+        await asyncio.sleep(max(0.0, next_time - loop.time()))
 
 async def send_reliable_with_retry(udp, addr, seq, payload, max_retries=5):
     """Send reliable message with automatic retransmission on timeout"""
@@ -33,7 +44,7 @@ async def send_reliable_with_retry(udp, addr, seq, payload, max_retries=5):
         ts = int(time.monotonic())
         
         # Send with delay and potential drop
-        sent = await delayed_send(udp, addr, ChannelType.RELIABLE, seq, ts, payload)
+        sent = await udp.send_message(ChannelType.RELIABLE, seq, ts, payload, addr)
         
         if sent:
             print(f"[CLIENT SEND] REL seq={seq} (attempt {retries + 1})")
@@ -64,15 +75,20 @@ async def send_reliable_with_retry(udp, addr, seq, payload, max_retries=5):
     print(f"[CLIENT FAILED] REL seq={seq} - max retries reached")
     return False
 
-async def run_client():
+async def run_client(protocol: str):
     addr = ("127.0.0.1", 9999)
     udp = await HUDP().start(remote_addr=addr)
-    
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
     # Client maintains its own sequence numbers
     reliable_seq = 0
     unreliable_seq = 0
     
     try:
+        if protocol == "udp":
+            await send_udp(addr, sock, 50, 10, 240)
+            return
         async def send_loop():
             nonlocal reliable_seq, unreliable_seq
             while True:
@@ -88,7 +104,7 @@ async def run_client():
                     #continue # for testing of ONLY reliable
                     # Unreliable messages - send once with delay/drop, no retry
                     ts = int(time.monotonic())
-                    sent = await delayed_send(udp, addr, ChannelType.UNRELIABLE, unreliable_seq, ts, "hello")
+                    sent = udp.send_message(ChannelType.UNRELIABLE, unreliable_seq, ts, "hello", addr)
                     
                     if sent:
                         print(f"[CLIENT SEND] UNREL seq={unreliable_seq}")
@@ -121,6 +137,7 @@ async def run_client():
         print("\n[CLIENT] Interrupted")
     finally:
         udp.close()
+        sock.close()
 
 if __name__ == "__main__":
-    asyncio.run(run_client())
+    asyncio.run(run_client("udp"))

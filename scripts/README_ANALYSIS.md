@@ -1,6 +1,27 @@
 # from repo root
 export PYTHONPATH=src
 
+## Testing UDP
+```shell
+uv run scripts/client.py
+```
+
+```shell
+uv run scripts/server.py
+```
+
+Network modes
+```shell
+# Good
+sudo tc qdisc add dev lo root netem delay 50ms 10ms loss 1%
+
+# Average
+sudo tc qdisc add dev lo root netem delay 200ms 25ms loss 5%
+
+# Poor
+sudo tc qdisc add dev lo root netem delay 500ms 50ms loss 15%
+```
+
 # create venv in WSL home (fast)
 python3 -m venv ~/.venvs/ass4
 source ~/.venvs/ass4/bin/activate
