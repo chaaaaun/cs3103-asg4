@@ -62,7 +62,7 @@ async def delays_and_drop(udp, payload, seq, payload_len):
             # packet lost
         else:
             payload = pack_payload(seq & 0xFFFFFF, now_ms(), os.urandom(payload_len))
-            udp.send_message(ChannelType.UNRELIABLE, seq & 0xFFFFFF, int(time.time()), payload)
+            udp.send_message(ChannelType.UNRELIABLE, False, seq & 0xFFFFFF, payload)
 
 
 async def run_hudp(addr: str, port: int, pps: int, duration_s: int, payload_len: int):

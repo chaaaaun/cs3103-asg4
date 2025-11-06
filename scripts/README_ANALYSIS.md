@@ -3,11 +3,11 @@ export PYTHONPATH=src
 
 ## Testing UDP
 ```shell
-uv run scripts/client.py
+uv run scripts/client.py --protocol udp/hudp
 ```
 
 ```shell
-uv run scripts/server.py
+uv run scripts/server.py --protocol udp/hudp
 ```
 
 Network modes

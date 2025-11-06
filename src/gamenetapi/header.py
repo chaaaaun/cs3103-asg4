@@ -63,7 +63,7 @@ def encode_packet(channel: ChannelType, ack: bool, seq: int, ts: int, payload: s
     return u8 + u24 + u32 + payload
 
 
-def decode_packet(data: bytes) -> Tuple[ChannelType, bool, int, int, bytes]:
+def decode_packet(data: bytes, addr: Addr) -> HudpMessage:
     if len(data) < HEADER_SIZE:
         raise ValueError(f"Datagram too short for header: {len(data)} < {HEADER_SIZE}")
 
@@ -72,4 +72,4 @@ def decode_packet(data: bytes) -> Tuple[ChannelType, bool, int, int, bytes]:
     seq = _unpack_u24_be(data[1:4])
     ts = int.from_bytes(data[4:8], "big", signed=False)
     payload = data[8:]
-    return channel, ack, seq, ts, payload
+    return HudpMessage(channel, ack, seq, ts, payload, addr)

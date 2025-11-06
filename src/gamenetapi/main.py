@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import socket
 import time
 from collections import defaultdict
@@ -7,6 +8,7 @@ from typing import Optional, Tuple, Union, Dict, Any, List
 from gamenetapi.header import (
     encode_packet, decode_packet, HudpMessage, ChannelType, Addr, BytesLike
 )
+from gamenetapi.metrics import Metrics
 
 PACKET_TIMEOUT_MS = 50.0  # per-packet retransmit timer period
 GIVEUP_TIMEOUT_MS = 200.0  # drop unacked packet (sender) / skip missing (receiver) after this
@@ -43,6 +45,11 @@ class HUDP:
         self._protocol: Optional[_UDPProtocol] = None
         self._recv_task: Optional[asyncio.Task] = None
         self._closed = False
+        self._metrics = Metrics(1.0, 1024)
+        self._results = {
+            ChannelType.RELIABLE: [],
+            ChannelType.UNRELIABLE: [],
+        }
 
         # Selective Repeat state
         self.send_window: Dict[Tuple[Addr, int], Dict[str, Any]] = {}
@@ -96,18 +103,18 @@ class HUDP:
             raise ValueError("No destination address for try_send_reliable")
         if self._inflight_count(addr) >= SEND_WINDOW_SIZE:
             return None
-        return self.send_message(ChannelType.RELIABLE, False, seq, self._get_timestamp_ms(), payload, addr=addr)
+        return self.send_message(ChannelType.RELIABLE, False, seq, payload, addr=addr)
 
     # Blocking SR send (explicit seq); waits for a sender slot
     async def send_reliable_with_window(self, seq: int, payload: Union[str, bytes], addr: Optional[Addr] = None,
                                         timeout: Optional[float] = None) -> int:
         await self.wait_for_window(addr=addr, timeout=timeout)
-        return self.send_message(ChannelType.RELIABLE, False, seq, self._get_timestamp_ms(), payload, addr=addr)
+        return self.send_message(ChannelType.RELIABLE, False, seq, payload, addr=addr)
 
     # Blocking SU send (explicit seq)
     async def send_unreliable(self, seq: int, payload: Union[str, bytes], addr: Optional[Addr] = None,
                                         timeout: Optional[float] = None) -> int:
-        return self.send_message(ChannelType.UNRELIABLE, False, seq, self._get_timestamp_ms(), payload, addr=addr)
+        return self.send_message(ChannelType.UNRELIABLE, False, seq, payload, addr=addr)
 
     async def start(self, local_addr: Optional[Addr] = None, remote_addr: Optional[Addr] = None) -> "HUDP":
         loop = asyncio.get_running_loop()
@@ -150,7 +157,7 @@ class HUDP:
             raise ValueError("No destination address specified")
         self._transport.sendto(bytes(data), addr)
 
-    def send_message(self, channel: ChannelType, ack: bool, seq: Optional[int], ts: int, payload: Union[str, bytes],
+    def send_message(self, channel: ChannelType, ack: bool, seq: Optional[int], payload: Union[str, bytes],
                      addr: Optional[Addr] = None) -> int:
         if isinstance(payload, str):
             payload = payload.encode()
@@ -215,21 +222,25 @@ class HUDP:
             print(f"[RETRANSMIT] seq={seq} to {addr} (retry #{entry['retries']})")
 
     async def recv_message(self) -> HudpMessage:
-        return await self._app_queue.get()
+        msg = await self._app_queue.get()
+        r = self._metrics.update_from_packet(msg.seq, msg.ts, msg.payload)
+        self._results[msg.channel].append(r)
+        return msg
 
     async def _recv_loop(self):
         try:
             while not self._closed:
                 data, addr = await self._recv_queue.get()
                 try:
-                    channel, ack, seq, ts, payload = decode_packet(data)
+                    msg = decode_packet(data, addr)
                 except Exception as e:
                     print(f"[ERROR] Bad packet from {addr}: {e}")
                     continue
 
+                channel, ack, seq, ts, payload, _ = dataclasses.astuple(msg)
                 # Deliver unreliable packets immediately, no need sequence number also actually.
                 if channel == ChannelType.UNRELIABLE:
-                    await self._app_queue.put(HudpMessage(channel, seq, ts, payload, addr))
+                    await self._app_queue.put(msg)
                     print(f"[RECV UNREL] seq={seq} from {addr}")
 
                 # ACK messages: cancel retransmit timers
@@ -260,7 +271,7 @@ class HUDP:
 
                     # Duplicate older than base -> re-ACK and discard
                     if seq < base:
-                        self.send_message(ChannelType.RELIABLE, True, seq, self._get_timestamp_ms(), b'', addr)
+                        self.send_message(ChannelType.RELIABLE, True, seq, b'', addr)
                         print(f"[RECV REL] seq={seq} from {addr} (duplicate < base), reACK")
                         continue
 
@@ -273,7 +284,7 @@ class HUDP:
                         continue
 
                     # SR: ACK on receipt (even if buffered)
-                    self.send_message(ChannelType.RELIABLE, True, seq, self._get_timestamp_ms(), b'', addr)
+                    self.send_message(ChannelType.RELIABLE, True, seq, b'', addr)
 
                     if seq == base:
                         await self._deliver_in_order(addr, seq, ts, payload)
@@ -282,7 +293,7 @@ class HUDP:
                     elif seq in self.recv_window[addr]:
                         print(f"[RECV REL] seq={seq} from {addr} (duplicate)")
                     else:
-                        msg = HudpMessage(channel, seq, ts, payload, addr)
+                        msg = HudpMessage(channel, ack, seq, ts, payload, addr)
                         msg.arrival_time = time.monotonic()  # harmless with gap-age logic
                         self.recv_window[addr][seq] = msg
                         print(f"[RECV REL] seq={seq} from {addr} (buffered, expecting {base})")
@@ -326,7 +337,7 @@ class HUDP:
         await self._deliver_buffered(addr)
 
     async def _deliver_in_order(self, addr: Addr, seq: int, ts: int, payload: bytes):
-        msg = HudpMessage(ChannelType.RELIABLE, seq, ts, payload, addr)
+        msg = HudpMessage(ChannelType.RELIABLE, False, seq, ts, payload, addr)
         await self._app_queue.put(msg)
         print(f"[RECV REL] seq={seq} from {addr} (in-order)")
         self.recv_base[addr] = (self.recv_base[addr] + 1) % MAX_SEQ
@@ -344,3 +355,14 @@ class HUDP:
         if any(s > self.recv_base[addr] for s in self.recv_window[addr].keys()):
             if self.gap_start[addr] is None:
                 self.gap_start[addr] = time.monotonic()
+
+    def list_metrics(self, channel: ChannelType):
+        return self._results[channel]
+
+    def get_metrics(self, channel: ChannelType, seq: int):
+        try:
+            return self._results[channel][seq]
+        except KeyError:
+            return None
+        except IndexError:
+            return None
