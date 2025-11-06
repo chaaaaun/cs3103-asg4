@@ -2,15 +2,16 @@ import asyncio
 import socket
 import time
 from collections import defaultdict
-from typing import Optional, Tuple, Union, Dict, Any
+from typing import Optional, Tuple, Union, Dict, Any, List
 
 from gamenetapi.header import (
     _encode_header, _decode_header, HudpMessage, ChannelType, Addr, BytesLike
 )
 
-PACKET_TIMEOUT_MS = 50
-GIVEUP_TIMEOUT_MS = 200.0
-WINDOW_SIZE = 5
+PACKET_TIMEOUT_MS = 50.0      # per-packet retransmit timer period
+GIVEUP_TIMEOUT_MS = 200.0     # drop unacked packet (sender) / skip missing (receiver) after this
+SEND_WINDOW_SIZE = 5
+WINDOW_SIZE = 10               
 MAX_SEQ = 65536
 
 class _UDPProtocol(asyncio.DatagramProtocol):
@@ -51,6 +52,57 @@ class HUDP:
 
         self._remote_addr: Optional[Addr] = None
 
+        # Gap-age timer (receiver)
+        self.gap_start: Dict[Addr, Optional[float]] = defaultdict(lambda: None)
+
+        # Sender window event per address (wake blocked senders)
+        self._win_event: Dict[Addr, asyncio.Event] = {}
+
+    def _get_win_event(self, addr: Addr) -> asyncio.Event:
+        ev = self._win_event.get(addr)
+        if ev is None:
+            ev = asyncio.Event()
+            ev.set()  # initially open
+            self._win_event[addr] = ev
+        return ev
+
+    def _inflight_count(self, addr: Addr) -> int:
+        return sum(1 for (a, _) in self.send_window.keys() if a == addr)
+
+    async def wait_for_window(self, addr: Optional[Addr] = None, timeout: Optional[float] = None) -> None:
+        if addr is None:
+            addr = self._remote_addr
+        if addr is None:
+            raise ValueError("No destination address for wait_for_window")
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        while self._inflight_count(addr) >= SEND_WINDOW_SIZE:
+            ev = self._get_win_event(addr)
+            ev.clear()
+            if timeout is None:
+                await ev.wait()
+            else:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait_for(ev.wait(), timeout=remaining)
+
+    # Non-blocking SR send (explicit seq); returns None if window full
+    def try_send_reliable(self, seq: int, payload: Union[str, bytes], addr: Optional[Addr] = None) -> Optional[int]:
+        if addr is None:
+            addr = self._remote_addr
+        if addr is None:
+            raise ValueError("No destination address for try_send_reliable")
+        if self._inflight_count(addr) >= SEND_WINDOW_SIZE:
+            return None
+        return self.send_message(ChannelType.RELIABLE, seq, self._get_timestamp_ms(), payload, addr=addr)
+
+    # Blocking SR send (explicit seq); waits for a sender slot
+    async def send_reliable_with_window(self, seq: int, payload: Union[str, bytes], addr: Optional[Addr] = None,
+                                        timeout: Optional[float] = None) -> int:
+        await self.wait_for_window(addr=addr, timeout=timeout)
+        return self.send_message(ChannelType.RELIABLE, seq, self._get_timestamp_ms(), payload, addr=addr)
+
     async def start(self, local_addr: Optional[Addr] = None, remote_addr: Optional[Addr] = None) -> "HUDP":
         loop = asyncio.get_running_loop()
         transport, protocol = await loop.create_datagram_endpoint(
@@ -62,8 +114,6 @@ class HUDP:
         self._transport = transport
         self._protocol = protocol
         self._remote_addr = remote_addr
-
-        # Start the main receive loop
         self._recv_task = asyncio.create_task(self._recv_loop())
         return self
 
@@ -80,7 +130,7 @@ class HUDP:
         self.send_window.clear()
 
     def _get_timestamp_ms(self) -> int:
-        return int(time.time() * 1000) % (2**32)
+        return int(time.monotonic() * 1000) % (2**32)
 
     def _in_window(self, seq: int, base: int, size: int) -> bool:
         return ((seq - base) % MAX_SEQ) < size
@@ -104,9 +154,14 @@ class HUDP:
         if addr is None:
             raise ValueError("No destination address for send_message")
 
+        # --- seq handling (supports explicit seq from caller) ---
         if seq is None:
             seq = self.send_seq[addr]
             self.send_seq[addr] = (seq + 1) % MAX_SEQ
+        else:
+            ahead = (seq + 1 - self.send_seq[addr]) % MAX_SEQ
+            if 0 < ahead < (MAX_SEQ // 2):
+                self.send_seq[addr] = (seq + 1) % MAX_SEQ
 
         ts = self._get_timestamp_ms()
         header = _encode_header(channel, seq, ts)
@@ -120,8 +175,8 @@ class HUDP:
             key = (addr, seq)
             self.send_window[key] = {
                 'packet': packet,
-                'first_sent': time.time(),
-                'last_sent': time.time(),
+                'first_sent': time.monotonic(),
+                'last_sent': time.monotonic(),
                 'retries': 0,
                 'timer': asyncio.create_task(self._retransmit_timer(addr, seq))
             }
@@ -141,15 +196,16 @@ class HUDP:
             if key not in self.send_window:
                 break
             entry = self.send_window[key]
-            elapsed = (time.time() - entry['first_sent']) * 1000
+            elapsed = (time.monotonic() - entry['first_sent']) * 1000
 
             # If elapsed time exceeds max time allowed, skip the packet.
             if elapsed >= GIVEUP_TIMEOUT_MS:
                 print(f"[GIVEUP] seq={seq} to {addr} after {elapsed:.0f}ms")
                 del self.send_window[key]
+                self._get_win_event(addr).set()  # free a slot
                 break
             self.send_raw(entry['packet'], addr)
-            entry['last_sent'] = time.time()
+            entry['last_sent'] = time.monotonic()
             entry['retries'] += 1
             print(f"[RETRANSMIT] seq={seq} to {addr} (retry #{entry['retries']})")
 
@@ -177,7 +233,7 @@ class HUDP:
                     if key in self.send_window:
                         entry = self.send_window[key]
                         if entry['retries'] == 0:
-                            rtt = (time.time() - entry['first_sent']) * 1000
+                            rtt = (time.monotonic() - entry['first_sent']) * 1000
                             print(f"[RECV ACK] seq={seq} from {addr}, RTT={rtt:.1f}ms")
                         else:
                             print(f"[RECV ACK] seq={seq} from {addr} (retransmitted)")
@@ -192,28 +248,77 @@ class HUDP:
                             if self.send_base[addr] == self.send_seq[addr]:
                                 break
 
-                elif channel == ChannelType.RELIABLE:
-                    self.send_message(ChannelType.ACK, seq, time.time(), b'', addr)
+                        self._get_win_event(addr).set()  # sender slot freed
 
+                elif channel == ChannelType.RELIABLE:
                     base = self.recv_base[addr]
+
+                    # Duplicate older than base -> re-ACK and discard
+                    if seq < base:
+                        self.send_message(ChannelType.ACK, seq, self._get_timestamp_ms(), b'', addr)
+                        print(f"[RECV REL] seq={seq} from {addr} (duplicate < base), reACK")
+                        continue
+
+                    # Before processing, see if the current head-of-line gap has aged out
+                    await self._maybe_skip_gap_on_timeout(addr, seq)
+                    base = self.recv_base[addr]
+
                     if not self._in_window(seq, base, WINDOW_SIZE):
                         print(f"[RECV REL] seq={seq} from {addr} outside window [base={base}]")
                         continue
 
+                    # SR: ACK on receipt (even if buffered)
+                    self.send_message(ChannelType.ACK, seq, self._get_timestamp_ms(), b'', addr)
+
                     if seq == base:
                         await self._deliver_in_order(addr, seq, ts, payload)
                         await self._deliver_buffered(addr)
+                        self.gap_start[addr] = None
                     elif seq in self.recv_window[addr]:
                         print(f"[RECV REL] seq={seq} from {addr} (duplicate)")
                     else:
                         msg = HudpMessage(channel, seq, ts, payload, addr)
-                        msg.arrival_time = time.time()
+                        msg.arrival_time = time.monotonic()  # harmless with gap-age logic
                         self.recv_window[addr][seq] = msg
                         print(f"[RECV REL] seq={seq} from {addr} (buffered, expecting {base})")
-                        await self._check_timeout_gaps(addr)
+                        if self.gap_start[addr] is None:
+                            self.gap_start[addr] = time.monotonic()
 
         except asyncio.CancelledError:
             pass
+
+    async def _maybe_skip_gap_on_timeout(self, addr: Addr, incoming_seq: Optional[int]) -> None:
+        """
+        If we've been waiting for recv_base[addr] longer than GIVEUP_TIMEOUT_MS,
+        skip it and advance to the earliest available in-window candidate > base,
+        then immediately drain buffered contiguous packets.
+        """
+        gs = self.gap_start[addr]
+        if gs is None:
+            return
+
+        waited_ms = (time.monotonic() - gs) * 1000.0
+        if waited_ms < GIVEUP_TIMEOUT_MS:
+            return
+
+        base = self.recv_base[addr]
+        candidates: List[int] = []
+        if incoming_seq is not None and self._in_window(incoming_seq, base, WINDOW_SIZE) and incoming_seq > base:
+            candidates.append(incoming_seq)
+        for s in self.recv_window[addr].keys():
+            if s > base and self._in_window(s, base, WINDOW_SIZE):
+                candidates.append(s)
+
+        if candidates:
+            jump_to = min(candidates)
+        else:
+            # nothing available; minimally move base by one to avoid permanent stall
+            jump_to = (base + 1) % MAX_SEQ
+
+        print(f"[TIMEOUT] Skipping missing seq={base} after {waited_ms:.0f}ms")
+        self.recv_base[addr] = jump_to
+        self.gap_start[addr] = None
+        await self._deliver_buffered(addr)
 
     async def _deliver_in_order(self, addr: Addr, seq: int, ts: int, payload: bytes):
         msg = HudpMessage(ChannelType.RELIABLE, seq, ts, payload, addr)
@@ -230,23 +335,7 @@ class HUDP:
             base = (base + 1) % MAX_SEQ
             self.recv_base[addr] = base
 
-    async def _check_timeout_gaps(self, addr: Addr):
-        base = self.recv_base[addr]
-        # recv_window used to keep track of all the packets that have not yet been delivered to the application
-        # due to previous packets missing.
-        window = self.recv_window[addr]
-        if not window:
-            return
-        for seq in sorted(window.keys()):
-            if seq > base:
-                msg = window[seq]
-                if hasattr(msg, "arrival_time"):
-                    elapsed = (time.time() - msg.arrival_time) * 1000
-                    if elapsed >= GIVEUP_TIMEOUT_MS:
-                        print(f"[TIMEOUT] Skipping gap from seq={base} to seq={seq} after {elapsed:.0f}ms")
-                        self.recv_base[addr] = (seq + 1) % MAX_SEQ
-                        window.pop(seq)
-                        await self._app_queue.put(msg)
-                        base = self.recv_base[addr]
-                    else:
-                        break
+        # If still have future packets buffered, (re)start gap timer
+        if any(s > self.recv_base[addr] for s in self.recv_window[addr].keys()):
+            if self.gap_start[addr] is None:
+                self.gap_start[addr] = time.monotonic()

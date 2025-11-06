@@ -30,7 +30,7 @@ async def send_reliable_with_retry(udp, addr, seq, payload, max_retries=5):
     retries = 0
     
     while retries < max_retries:
-        ts = int(time.time())
+        ts = int(time.monotonic())
         
         # Send with delay and potential drop
         sent = await delayed_send(udp, addr, ChannelType.RELIABLE, seq, ts, payload)
@@ -45,8 +45,8 @@ async def send_reliable_with_retry(udp, addr, seq, payload, max_retries=5):
             # Check if we got an ACK within timeout period
             # This assumes the HUDP implementation handles ACKs internally
             # and removes from send_window when ACK received
-            start_time = time.time()
-            while time.time() - start_time < RETRANSMIT_TIMEOUT:
+            start_time = time.monotonic()
+            while time.monotonic() - start_time < RETRANSMIT_TIMEOUT:
                 # Check if message is still in send window (not ACKed)
                 if (addr, seq) not in udp.send_window:
                     print(f"[CLIENT ACK] REL seq={seq} acknowledged")
@@ -79,22 +79,15 @@ async def run_client():
                 is_reliable = random.random() < RELIABILITY_RATIO
                 
                 if is_reliable:
-                    # Check window availability (only for reliable)
-                    active_reliable = sum(1 for (a, _) in udp.send_window.keys() if a == addr)
-                    
-                    if active_reliable >= WINDOW_SIZE:
-                        print(f"[CLIENT] Window full ({active_reliable}/{WINDOW_SIZE})")
-                        await asyncio.sleep(0.1)
-                        continue
-                    
-                    # Send reliable message with retry logic
-                    asyncio.create_task(send_reliable_with_retry(udp, addr, reliable_seq, "hello"))
+                    # BLOCK until window has room, then send with explicit seq
+                    sent_seq = await udp.send_reliable_with_window(reliable_seq, "hello", addr=addr)
+                    print(f"[CLIENT SEND] REL seq={sent_seq}")
                     reliable_seq += 1
                     
                 else:
                     #continue # for testing of ONLY reliable
                     # Unreliable messages - send once with delay/drop, no retry
-                    ts = int(time.time())
+                    ts = int(time.monotonic())
                     sent = await delayed_send(udp, addr, ChannelType.UNRELIABLE, unreliable_seq, ts, "hello")
                     
                     if sent:
