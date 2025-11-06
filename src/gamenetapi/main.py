@@ -5,14 +5,15 @@ from collections import defaultdict
 from typing import Optional, Tuple, Union, Dict, Any, List
 
 from gamenetapi.header import (
-    _encode_header, _decode_header, HudpMessage, ChannelType, Addr, BytesLike
+    encode_packet, decode_packet, HudpMessage, ChannelType, Addr, BytesLike
 )
 
-PACKET_TIMEOUT_MS = 50.0      # per-packet retransmit timer period
-GIVEUP_TIMEOUT_MS = 200.0     # drop unacked packet (sender) / skip missing (receiver) after this
+PACKET_TIMEOUT_MS = 50.0  # per-packet retransmit timer period
+GIVEUP_TIMEOUT_MS = 200.0  # drop unacked packet (sender) / skip missing (receiver) after this
 SEND_WINDOW_SIZE = 5
-WINDOW_SIZE = 10               
+WINDOW_SIZE = 10
 MAX_SEQ = 65536
+
 
 class _UDPProtocol(asyncio.DatagramProtocol):
     def __init__(self, queue: "asyncio.Queue[Tuple[bytes, Addr]]"):
@@ -42,7 +43,7 @@ class HUDP:
         self._protocol: Optional[_UDPProtocol] = None
         self._recv_task: Optional[asyncio.Task] = None
         self._closed = False
-        
+
         # Selective Repeat state
         self.send_window: Dict[Tuple[Addr, int], Dict[str, Any]] = {}
         self.recv_window: Dict[Addr, Dict[int, HudpMessage]] = defaultdict(dict)
@@ -95,13 +96,18 @@ class HUDP:
             raise ValueError("No destination address for try_send_reliable")
         if self._inflight_count(addr) >= SEND_WINDOW_SIZE:
             return None
-        return self.send_message(ChannelType.RELIABLE, seq, self._get_timestamp_ms(), payload, addr=addr)
+        return self.send_message(ChannelType.RELIABLE, False, seq, self._get_timestamp_ms(), payload, addr=addr)
 
     # Blocking SR send (explicit seq); waits for a sender slot
     async def send_reliable_with_window(self, seq: int, payload: Union[str, bytes], addr: Optional[Addr] = None,
                                         timeout: Optional[float] = None) -> int:
         await self.wait_for_window(addr=addr, timeout=timeout)
-        return self.send_message(ChannelType.RELIABLE, seq, self._get_timestamp_ms(), payload, addr=addr)
+        return self.send_message(ChannelType.RELIABLE, False, seq, self._get_timestamp_ms(), payload, addr=addr)
+
+    # Blocking SU send (explicit seq)
+    async def send_unreliable(self, seq: int, payload: Union[str, bytes], addr: Optional[Addr] = None,
+                                        timeout: Optional[float] = None) -> int:
+        return self.send_message(ChannelType.UNRELIABLE, False, seq, self._get_timestamp_ms(), payload, addr=addr)
 
     async def start(self, local_addr: Optional[Addr] = None, remote_addr: Optional[Addr] = None) -> "HUDP":
         loop = asyncio.get_running_loop()
@@ -130,7 +136,7 @@ class HUDP:
         self.send_window.clear()
 
     def _get_timestamp_ms(self) -> int:
-        return int(time.monotonic() * 1000) % (2**32)
+        return int(time.monotonic() * 1000) % (2 ** 32)
 
     def _in_window(self, seq: int, base: int, size: int) -> bool:
         return ((seq - base) % MAX_SEQ) < size
@@ -144,8 +150,8 @@ class HUDP:
             raise ValueError("No destination address specified")
         self._transport.sendto(bytes(data), addr)
 
-    def send_message(self, channel: ChannelType, seq: Optional[int], ts: int,
-                     payload: Union[str, bytes], addr: Optional[Addr] = None) -> int:
+    def send_message(self, channel: ChannelType, ack: bool, seq: Optional[int], ts: int, payload: Union[str, bytes],
+                     addr: Optional[Addr] = None) -> int:
         if isinstance(payload, str):
             payload = payload.encode()
 
@@ -164,14 +170,13 @@ class HUDP:
                 self.send_seq[addr] = (seq + 1) % MAX_SEQ
 
         ts = self._get_timestamp_ms()
-        header = _encode_header(channel, seq, ts)
-        packet = header + payload
+        packet = encode_packet(channel, ack, seq, ts, payload)
 
         self.send_raw(packet, addr)
 
         if channel == ChannelType.UNRELIABLE:
             print(f"[SEND UNREL] seq={seq} to {addr}")
-        elif channel == ChannelType.RELIABLE:
+        elif channel == ChannelType.RELIABLE and not ack:
             key = (addr, seq)
             self.send_window[key] = {
                 'packet': packet,
@@ -181,7 +186,7 @@ class HUDP:
                 'timer': asyncio.create_task(self._retransmit_timer(addr, seq))
             }
             print(f"[SEND REL] seq={seq} to {addr}")
-        elif channel == ChannelType.ACK:
+        elif channel == ChannelType.RELIABLE and ack:
             print(f"[SEND ACK] seq={seq} to {addr}")
 
         return seq
@@ -217,7 +222,7 @@ class HUDP:
             while not self._closed:
                 data, addr = await self._recv_queue.get()
                 try:
-                    channel, seq, ts, payload = _decode_header(data)
+                    channel, ack, seq, ts, payload = decode_packet(data)
                 except Exception as e:
                     print(f"[ERROR] Bad packet from {addr}: {e}")
                     continue
@@ -228,7 +233,7 @@ class HUDP:
                     print(f"[RECV UNREL] seq={seq} from {addr}")
 
                 # ACK messages: cancel retransmit timers
-                elif channel == ChannelType.ACK:
+                elif channel == ChannelType.RELIABLE and ack:
                     key = (addr, seq)
                     if key in self.send_window:
                         entry = self.send_window[key]
@@ -255,7 +260,7 @@ class HUDP:
 
                     # Duplicate older than base -> re-ACK and discard
                     if seq < base:
-                        self.send_message(ChannelType.ACK, seq, self._get_timestamp_ms(), b'', addr)
+                        self.send_message(ChannelType.RELIABLE, True, seq, self._get_timestamp_ms(), b'', addr)
                         print(f"[RECV REL] seq={seq} from {addr} (duplicate < base), reACK")
                         continue
 
@@ -268,7 +273,7 @@ class HUDP:
                         continue
 
                     # SR: ACK on receipt (even if buffered)
-                    self.send_message(ChannelType.ACK, seq, self._get_timestamp_ms(), b'', addr)
+                    self.send_message(ChannelType.RELIABLE, True, seq, self._get_timestamp_ms(), b'', addr)
 
                     if seq == base:
                         await self._deliver_in_order(addr, seq, ts, payload)
