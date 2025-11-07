@@ -57,8 +57,10 @@ async def run_server(protocol, target, timeout):
             await asyncio.wait_for(run_udp_server(target), timeout)
         elif protocol == "hudp":
             await asyncio.wait_for(run_hudp_server(target), timeout)
+    except asyncio.TimeoutError:
+        print("Testing ending automatically due to asyncio timeout error...")
     except TimeoutError:
-        print("Testing ending automatically...")
+        print("Testing ending automatically due to timeout error...")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

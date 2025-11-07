@@ -51,18 +51,18 @@ def unpack_payload(b: bytes):
     user = b[11:]
     return seq, send_ms, user
 
-async def delays_and_drop(udp, payload, seq, payload_len):
+async def delays_and_drop(udp, seq, payload_len):
     # Simulate network delay (used to represent latency)
-        network_delay = max(0, random.gauss(DELAY_MEAN, DELAY_JITTER))
-        await asyncio.sleep(network_delay)
+    network_delay = max(0, random.gauss(DELAY_MEAN, DELAY_JITTER))
+    await asyncio.sleep(network_delay)
 
-        # Simulating packet loss
-        if random.random() < PACKET_LOSS_RATE:
-            print(f"[DROP] message")
-            # packet lost
-        else:
-            payload = pack_payload(seq & 0xFFFFFF, now_ms(), os.urandom(payload_len))
-            udp.send_message(ChannelType.UNRELIABLE, False, seq & 0xFFFFFF, payload)
+    # Simulating packet loss
+    if random.random() < PACKET_LOSS_RATE:
+        print(f"[DROP] seq={seq} message")
+        # packet lost
+    else:
+        payload = pack_payload(seq & 0xFFFFFF, now_ms(), os.urandom(payload_len))
+        await udp.send_reliable_with_window(seq & 0xFFFFFF, payload)
 
 
 async def run_hudp_u(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
@@ -84,7 +84,7 @@ async def run_hudp_u(addr: str, port: int, pps: int, duration_s: int, payload_le
         while time.time() < t_end:
             # send one packet
             payload = pack_payload(seq & 0xFFFFFF, now_ms(), os.urandom(payload_len))
-            udp.send_message(ChannelType.RELIABLE, False, seq & 0xFFFFFF, payload)
+            udp.send_message(ChannelType.UNRELIABLE, False, seq & 0xFFFFFF, payload)
             sent += 1
 
             # try to receive one (echo)
@@ -124,65 +124,122 @@ async def run_hudp_u(addr: str, port: int, pps: int, duration_s: int, payload_le
     finally:
         udp.close()
 
+ACK_GRACE_S = 0.5
 
 async def run_hudp_r(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
     assert HUDP is not None, "gamenetapi not available"
     udp = await HUDP().start(remote_addr=(addr, port))
-    mode = "hudp-reliable"  # flip to hudp-reliable later
+    mode = "hudp-reliable-pipelined"
+
     try:
-        seq = 0
         interval = 1.0 / max(1, pps)
         t_end = time.time() + duration_s
 
-        sent = 0
-        got = 0
-        bytes_recv = 0
+        # accounting
+        sent = 0                 # actually transmitted (not locally dropped)
+        acked = 0
+        bytes_acked = 0
         last_t = time.time()
         jitter = 0.0
         prev_rtt = None
 
-        while time.time() < t_end:
-            # send one packet
-            payload = pack_payload(seq & 0xFFFFFF, now_ms(), os.urandom(payload_len))
-            asyncio.create_task(delays_and_drop(udp, payload, seq, payload_len))
-            sent += 1
+        pending: set[int] = set()     # seqs we tried to send and expect ACKs for
+        tasks: list[asyncio.Task] = [] # send tasks
 
-            # try to receive one (echo)
-            try:
-                udp._transport.set_write_buffer_limits(0)  # keep it simple
-                resp = await asyncio.wait_for(udp.recv_message(), timeout=interval)
-                r_seq, s_ms, user = unpack_payload(resp.payload)
-                rtt = now_ms() - s_ms
-                got += 1
-                bytes_recv += len(resp.payload)
+        stop_acks = asyncio.Event()
 
-                # PDR and throughput estimates
-                pdr = got / sent if sent else 0.0
+        async def ack_listener():
+            nonlocal acked, bytes_acked, last_t, jitter, prev_rtt
+            while not stop_acks.is_set():
+                try:
+                    evt = await asyncio.wait_for(udp._ack_q.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    continue
+
+                seq = evt["seq"]
+                rtt = evt["rtt_ms"]
+
+                if seq in pending:
+                    pending.remove(seq)
+                acked += 1
+                bytes_acked += payload_len
+
+                # PDR & throughput every ~1s
+                pdr = (acked / sent) if sent else 0.0
                 elapsed = time.time() - last_t
+                throughput_bps = ""
                 if elapsed >= 1.0:
-                    throughput_bps = bytes_recv * 8 / elapsed
-                    bytes_recv = 0
+                    throughput_bps = bytes_acked * 8 / elapsed
+                    bytes_acked = 0
                     last_t = time.time()
-                else:
-                    throughput_bps = ""
 
-                # RFC3550 jitter estimator on RTT deltas (good enough for comparison)
+                # simple jitter estimator on ACK RTT deltas
                 if prev_rtt is not None:
                     d = abs(rtt - prev_rtt)
                     jitter += (d - jitter) / 16.0
                 prev_rtt = rtt
 
-                write_row(mode=mode, event="echo_ok", seq=r_seq, send_ms=s_ms, recv_ms=now_ms(),
-                          rtt_ms=rtt, bytes=len(resp.payload), pdr=pdr, throughput_bps=throughput_bps, jitter_ms=round(jitter,2))
-            except asyncio.TimeoutError:
-                write_row(mode=mode, event="echo_timeout", seq=seq, send_ms=now_ms(),
-                          recv_ms="", rtt_ms="", bytes="", pdr=(got/sent if sent else 0.0), throughput_bps="", jitter_ms="")
+                write_row(mode=mode, event="echo_ok", seq=seq, send_ms="",
+                          recv_ms=now_ms(), rtt_ms=round(rtt, 1), bytes=payload_len,
+                          pdr=pdr, throughput_bps=throughput_bps, jitter_ms=round(jitter, 2))
+
+        ack_task = asyncio.create_task(ack_listener())
+
+        # schedule sends as fire-and-forget tasks
+        seq = 0
+        while time.time() < t_end:
+            s = seq  # capture per-iteration
+            async def one_send(s=s):
+                # do delay/loss & maybe send
+                actually_sent = await delays_and_drop(udp, s, payload_len)
+                if actually_sent:
+                    # mark pending & increment sent only when it really went out
+                    pending.add(s)
+                return actually_sent
+
+            t = asyncio.create_task(one_send())
+            tasks.append(t)
+
+            # keep pacing
+            await asyncio.sleep(interval)
+
+            # after the task completes, update 'sent' if it actually transmitted
+            try:
+                if await t:
+                    sent += 1
+            except Exception:
+                # defensive: log a failed send task as a local drop
+                print("error")
 
             seq += 1
-            # rate control
-            await asyncio.sleep(max(0.0, interval))
+
+        # all send tasks are created; wait for any still running to finish
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # grace period for late ACKs
+        try:
+            await asyncio.wait_for(stop_acks.wait(), timeout=0.0)
+        except Exception:
+            pass
+        await asyncio.sleep(ACK_GRACE_S)
+        stop_acks.set()
+        await asyncio.sleep(0)  # let ack_task notice the event
+        ack_task.cancel()
+        try:
+            await ack_task
+        except asyncio.CancelledError:
+            pass
+
+        # whatever is still pending now -> timeout
+        for s in sorted(pending):
+            write_row(mode=mode, event="echo_timeout", seq=s, send_ms=now_ms(),
+                      recv_ms="", rtt_ms="", bytes="", pdr=(acked/sent if sent else 0.0),
+                      throughput_bps="", jitter_ms="")
+
     finally:
         udp.close()
+
 
 
 
@@ -247,7 +304,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["udp", "hudp-u", "hudp-r"], required=True, help="udp=baseline raw, hudp=current HUDP (unreliable)")
     parser.add_argument("--addr", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument("--port", type=int, default=9999)
     parser.add_argument("--pps", type=int, default=200, help="packets per second")
     parser.add_argument("--duration", type=int, default=10, help="seconds")
     parser.add_argument("--payload", type=int, default=32, help="bytes of user payload")
@@ -256,5 +313,7 @@ if __name__ == "__main__":
     ensure_csv()
     if args.mode == "udp":
         run_raw(args.addr, args.port, args.pps, args.duration, args.payload)
-    else:
-        asyncio.run(run_hudp(args.addr, args.port, args.pps, args.duration, args.payload))
+    elif args.mode == "hudp-u":
+        asyncio.run(run_hudp_u(args.addr, args.port, args.pps, args.duration, args.payload))
+    else:  # "hudp-r"
+        asyncio.run(run_hudp_r(args.addr, args.port, args.pps, args.duration, args.payload))
