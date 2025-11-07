@@ -23,9 +23,7 @@ async def send_udp(target: Tuple[str, int], sock: socket.socket, pps: int, durat
 
     while loop.time() < end_time:
         next_time += interval
-        pkt = (seq & 0xFFFFFF).to_bytes(3, "big", signed=False) + struct.pack(">Q",
-                                                                              int(time.time() * 1000)) + os.urandom(
-            payload_len)
+        pkt = (seq & 0xFFFFFF).to_bytes(3, "big", signed=False) + struct.pack(">Q", int(time.time() * 1000)) + os.urandom(payload_len)
         sock.sendto(pkt, target)
 
         seq += 1

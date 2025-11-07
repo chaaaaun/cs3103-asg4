@@ -5,6 +5,7 @@ from typing import Optional
 DELAY_MEAN = 0.05           
 DELAY_JITTER = 0.02          # ±20 ms jitter
 PACKET_LOSS_RATE = 0.1
+ACK_GRACE_S = 1.0
 
 # Try to import HUDP only if used
 try:
@@ -60,9 +61,11 @@ async def delays_and_drop(udp, seq, payload_len):
     if random.random() < PACKET_LOSS_RATE:
         print(f"[DROP] seq={seq} message")
         # packet lost
+        return False
     else:
         payload = pack_payload(seq & 0xFFFFFF, now_ms(), os.urandom(payload_len))
         await udp.send_reliable_with_window(seq & 0xFFFFFF, payload)
+        return True
 
 
 async def run_hudp_u(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
@@ -124,8 +127,6 @@ async def run_hudp_u(addr: str, port: int, pps: int, duration_s: int, payload_le
     finally:
         udp.close()
 
-ACK_GRACE_S = 0.5
-
 async def run_hudp_r(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
     assert HUDP is not None, "gamenetapi not available"
     udp = await HUDP().start(remote_addr=(addr, port))
@@ -151,7 +152,7 @@ async def run_hudp_r(addr: str, port: int, pps: int, duration_s: int, payload_le
             nonlocal acked, bytes_acked, last_t, jitter, prev_rtt
             while not stop_acks.is_set():
                 try:
-                    evt = await asyncio.wait_for(udp._ack_queue.get(), timeout=0.5)
+                    evt = await asyncio.wait_for(udp._ack_queue.get(), timeout=0.1)
                 except asyncio.TimeoutError:
                     continue
 
@@ -218,7 +219,7 @@ async def run_hudp_r(addr: str, port: int, pps: int, duration_s: int, payload_le
 
         # grace period for late ACKs
         try:
-            await asyncio.wait_for(stop_acks.wait(), timeout=0.0)
+            await asyncio.wait_for(stop_acks.wait(), timeout=0.1)
         except Exception:
             pass
         await asyncio.sleep(ACK_GRACE_S)
@@ -305,7 +306,7 @@ if __name__ == "__main__":
     parser.add_argument("--addr", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9999)
     parser.add_argument("--pps", type=int, default=200, help="packets per second")
-    parser.add_argument("--duration", type=int, default=10, help="seconds")
+    parser.add_argument("--duration", type=int, default=60, help="seconds")
     parser.add_argument("--payload", type=int, default=32, help="bytes of user payload")
     args = parser.parse_args()
 
