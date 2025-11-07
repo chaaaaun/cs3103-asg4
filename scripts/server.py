@@ -1,13 +1,10 @@
 import argparse
 import asyncio
-import json
+import socket
 import struct
-import time
-from collections import deque
 
 import gamenetapi
 from gamenetapi import HUDP, ChannelType
-import socket
 
 
 async def run_udp_server(target):
@@ -54,8 +51,26 @@ async def run_hudp_server(target):
     except asyncio.CancelledError:
         pass
     finally:
-        print("Reliable", hudp.get_metrics(ChannelType.RELIABLE, -1))
-        print("Unreliable", hudp.get_metrics(ChannelType.UNRELIABLE, -1))
+        print("")
+        print("=====")
+        print("Sample metrics for last-sent unreliable packet")
+        print("=====")
+        rm = hudp.get_metrics(ChannelType.UNRELIABLE, -1)
+        print("single-packet one way latency: ", rm["one_way_latency_ms"], "ms")
+        print("jitter: ", rm["jitter_ms"], "ms")
+        print("session throughput: ", rm["throughput_bps"], "bps")
+        print("packet delivery ratio: ", rm["pdr_total"]*100, "%")
+
+        print("")
+        print("=====")
+        print("Sample metrics for last-sent reliable packet")
+        print("=====")
+        rm = hudp.get_metrics(ChannelType.RELIABLE, -1)
+        print("single-packet one way latency: ", rm["one_way_latency_ms"], "ms")
+        print("jitter: ", rm["jitter_ms"], "ms")
+        print("session throughput: ", rm["throughput_bps"], "bps")
+        print("packet delivery ratio: ", rm["pdr_total"]*100, "%")
+
         hudp.close()
 
 async def run_server(protocol, target, timeout):
@@ -66,15 +81,13 @@ async def run_server(protocol, target, timeout):
             await asyncio.wait_for(run_hudp_server(target), timeout)
     except asyncio.TimeoutError:
         print("Testing ending automatically due to asyncio timeout error...")
-    except TimeoutError:
-        print("Testing ending automatically due to timeout error...")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--protocol", "-p", choices=["udp", "hudp"], required=True)
     parser.add_argument("--addr", "-a", default="127.0.0.1")
     parser.add_argument("--port", "-P", type=int, default=9999)
-    parser.add_argument("--timeout", "-t", type=int, default=35)
+    parser.add_argument("--timeout", "-t", type=int, default=65)
     args = parser.parse_args()
 
     asyncio.run(run_server(args.protocol, (args.addr, args.port), args.timeout))
