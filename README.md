@@ -11,16 +11,33 @@
 - If you need to edit the test client or servers, find the files in `scripts/`
 - With this setup we can import and use functions from the API in client/server just like we would normal packages.
 
-# from repo root
-export PYTHONPATH=src
-
-# create venv in WSL home (fast)
-python3 -m venv ~/.venvs/ass4
-source ~/.venvs/ass4/bin/activate
-python -m pip install --upgrade pip
-python -m pip install matplotlib
+> [!NOTE]
+> If you want to run with regular python
+> ```shell
+> export PYTHONPATH=src
+> python3 -m venv ~/.venvs/ass4
+> source ~/.venvs/ass4/bin/activate
+> python -m pip install --upgrade pip
+> python -m pip install matplotlib
+> ```
 
 ## Testing / Running HUDP / Baseline UDP
+
+### Run server first
+
+```shell
+uv run scripts/server.py --protocol udp/hudp
+
+usage: server.py [-h] --protocol {udp,hudp} [--addr ADDR] [--port PORT] [--timeout TIMEOUT]
+server.py: error: the following arguments are required: --protocol/-p
+
+example command usage: uv run scripts/server.py --protocol hudp --addr 127.0.0.1 --port 9999 --timeout 60
+
+pps refers to packets per second, i.e. the sending rate
+```
+
+### Then client
+
 ```shell
 uv run scripts/client.py --protocol udp/hudp
 
@@ -45,16 +62,6 @@ duration = seconds to run
 payload = user payload bytes
 ```
 
-```shell
-uv run scripts/server.py --protocol udp/hudp
-
-usage: server.py [-h] --protocol {udp,hudp} [--addr ADDR] [--port PORT] [--timeout TIMEOUT]
-server.py: error: the following arguments are required: --protocol/-p
-
-example command usage: uv run scripts/server.py --protocol hudp --addr 127.0.0.1 --port 9999 --timeout 60
-
-pps refers to packets per second, i.e. the sending rate
-```
 
 ## Analysis to generate CSV and graphs
 
@@ -114,3 +121,8 @@ you can tune the p_reliable parameter to increase or decrease the proportion of 
 
 A higher p_reliable ratio increase the proportion of reliable packets sent and vice versa.
 ```
+
+
+## Acknowledgements
+- Matplotlib: for plotting the charts
+- LLMs: for protocol understanding and code completion assistance
