@@ -21,6 +21,7 @@ async def run_udp_server(target):
     try:
         while True:
             data, addr = sock.recvfrom(65535)
+            sock.sendto(data, addr)
             if len(data) < 11:
                 raise ValueError(f"packet too short: need at least 11 bytes, got {len(data)}")
 
@@ -46,6 +47,12 @@ async def run_hudp_server(target):
     try:
         while True:
             msg = await hudp.recv_message()
+            # Echo the payload back verbatim so the client can compute RTT/jitter/throughput
+            is_reliable = (msg.channel == ChannelType.RELIABLE)
+            # reuse the same seq so the client can match
+            hudp.send_message(msg.channel, is_reliable, msg.seq, msg.payload, addr=msg.addr)
+    except asyncio.CancelledError:
+        pass
     finally:
         print("Reliable", hudp.get_metrics(ChannelType.RELIABLE, -1))
         print("Unreliable", hudp.get_metrics(ChannelType.UNRELIABLE, -1))

@@ -12,11 +12,10 @@ async def run_server():
         print(f"UDP server listening on {HOST}:{PORT}...")
 
         while True:
-            data, addr = server_socket.recvfrom(1024)  # buffer size is 1024 bytes
-            print(f"Received message from {addr}: {data.decode()}")
+            data, addr = server_socket.recvfrom(65535)  # buffer size is 1024 bytes
+            # print(f"Received message from {addr}: {data.decode()}")
+            print(f"Received {len(data)} bytes from {addr}")
             
             # Echo message back to client
-            server_socket.sendto(b"Message received: " + data, addr)
-
-if __name__ == "__main__":
-    asyncio.run(run_server())
+            # server_socket.sendto(b"Message received: " + data, addr)
+            server_socket.sendto(data, addr)  
