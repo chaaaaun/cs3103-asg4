@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import random
 import socket
 import struct
 import time
@@ -63,6 +64,31 @@ async def send_hudp_reliable(target: Tuple[str, int], hudp: HUDP, pps: int, dura
 
         seq += 1
         await asyncio.sleep(max(0.0, next_time - loop.time()))
+        
+async def send_hudp_random(addr, hudp, pps: int, duration_s: int, payload_len: int, p_reliable: float = 0.5):
+    rel_seq = 0
+    unrel_seq = 0
+    interval = 1.0 / max(1, pps)
+
+    loop = asyncio.get_running_loop()
+    next_time = loop.time()
+    end_time = loop.time() + duration_s
+
+    while loop.time() < end_time:
+        next_time += interval
+
+        payload = os.urandom(payload_len)
+        if random.random() < p_reliable:
+            # reliable packet
+            await hudp.send_reliable_with_window(rel_seq, payload, addr)
+            rel_seq += 1
+        else:
+            # unreliable packet
+            await hudp.send_unreliable(unrel_seq, payload, addr)
+            unrel_seq += 1
+
+        # pace to pps
+        await asyncio.sleep(max(0.0, next_time - loop.time()))
 
 
 async def run_client(protocol: str, addr, pps: int, duration_s: int, payload_len: int):
@@ -77,10 +103,7 @@ async def run_client(protocol: str, addr, pps: int, duration_s: int, payload_len
         elif protocol == "unreliable":
             await send_hudp_unreliable(addr, hudp, pps, duration_s, payload_len)
         elif protocol == "hybrid":
-            await asyncio.gather(
-                send_hudp_reliable(addr, hudp, pps, duration_s, payload_len),
-                send_hudp_unreliable(addr, hudp, pps, duration_s, payload_len)
-            )
+            await send_hudp_random(addr, hudp, pps, duration_s, payload_len, p_reliable=0.4)
     except KeyboardInterrupt:
         print("\n[CLIENT] Interrupted")
         return
