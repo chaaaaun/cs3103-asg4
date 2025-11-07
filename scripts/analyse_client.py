@@ -65,10 +65,70 @@ async def delays_and_drop(udp, payload, seq, payload_len):
             udp.send_message(ChannelType.UNRELIABLE, False, seq & 0xFFFFFF, payload)
 
 
-async def run_hudp(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
+async def run_hudp_u(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
     assert HUDP is not None, "gamenetapi not available"
     udp = await HUDP().start(remote_addr=(addr, port))
     mode = "hudp-unreliable"  # flip to hudp-reliable later
+    try:
+        seq = 0
+        interval = 1.0 / max(1, pps)
+        t_end = time.time() + duration_s
+
+        sent = 0
+        got = 0
+        bytes_recv = 0
+        last_t = time.time()
+        jitter = 0.0
+        prev_rtt = None
+
+        while time.time() < t_end:
+            # send one packet
+            payload = pack_payload(seq & 0xFFFFFF, now_ms(), os.urandom(payload_len))
+            udp.send_message(ChannelType.RELIABLE, False, seq & 0xFFFFFF, payload)
+            sent += 1
+
+            # try to receive one (echo)
+            try:
+                udp._transport.set_write_buffer_limits(0)  # keep it simple
+                resp = await asyncio.wait_for(udp.recv_message(), timeout=interval)
+                r_seq, s_ms, user = unpack_payload(resp.payload)
+                rtt = now_ms() - s_ms
+                got += 1
+                bytes_recv += len(resp.payload)
+
+                # PDR and throughput estimates
+                pdr = got / sent if sent else 0.0
+                elapsed = time.time() - last_t
+                if elapsed >= 1.0:
+                    throughput_bps = bytes_recv * 8 / elapsed
+                    bytes_recv = 0
+                    last_t = time.time()
+                else:
+                    throughput_bps = ""
+
+                # RFC3550 jitter estimator on RTT deltas (good enough for comparison)
+                if prev_rtt is not None:
+                    d = abs(rtt - prev_rtt)
+                    jitter += (d - jitter) / 16.0
+                prev_rtt = rtt
+
+                write_row(mode=mode, event="echo_ok", seq=r_seq, send_ms=s_ms, recv_ms=now_ms(),
+                          rtt_ms=rtt, bytes=len(resp.payload), pdr=pdr, throughput_bps=throughput_bps, jitter_ms=round(jitter,2))
+            except asyncio.TimeoutError:
+                write_row(mode=mode, event="echo_timeout", seq=seq, send_ms=now_ms(),
+                          recv_ms="", rtt_ms="", bytes="", pdr=(got/sent if sent else 0.0), throughput_bps="", jitter_ms="")
+
+            seq += 1
+            # rate control
+            await asyncio.sleep(max(0.0, interval))
+    finally:
+        udp.close()
+
+
+async def run_hudp_r(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
+    assert HUDP is not None, "gamenetapi not available"
+    udp = await HUDP().start(remote_addr=(addr, port))
+    mode = "hudp-reliable"  # flip to hudp-reliable later
     try:
         seq = 0
         interval = 1.0 / max(1, pps)
@@ -123,6 +183,8 @@ async def run_hudp(addr: str, port: int, pps: int, duration_s: int, payload_len:
             await asyncio.sleep(max(0.0, interval))
     finally:
         udp.close()
+
+
 
 def run_raw(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
     mode = "udp-baseline"
@@ -183,7 +245,7 @@ def run_raw(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["udp", "hudp"], required=True, help="udp=baseline raw, hudp=current HUDP (unreliable)")
+    parser.add_argument("--mode", choices=["udp", "hudp-u", "hudp-r"], required=True, help="udp=baseline raw, hudp=current HUDP (unreliable)")
     parser.add_argument("--addr", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--pps", type=int, default=200, help="packets per second")
