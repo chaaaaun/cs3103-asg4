@@ -60,10 +60,16 @@ cp -f metrics_udp_clean.csv  metrics.csv
 python scripts/plot_metrics.py
 
 # quick summary
-python - <<'PY'
+```python
+# python - <<'PY'
 import csv, math, statistics as S, sys
-def pct(a,p): a=sorted(a); k=(len(a)-1)*p/100; f=math.floor(k); c=min(f+1,len(a)-1); \
-    print("", end=""); return a[f] if f==k else a[f]+(a[c]-a[f])*(k-f)
+def pct(a,p):
+    a=sorted(a)
+    k=(len(a)-1)*p/100
+    f=math.floor(k)
+    c=min(f+1,len(a)-1)
+    print("", end="")
+    return a[f] if f==k else a[f]+(a[c]-a[f])*(k-f)
 for fn in ("metrics_udp_clean.csv","metrics_hudp_clean.csv"):
     rows=[r for r in csv.DictReader(open(fn)) if r["event"]=="echo_ok"]
     mode = rows[0]["mode"] if rows else fn
@@ -75,4 +81,5 @@ for fn in ("metrics_udp_clean.csv","metrics_hudp_clean.csv"):
     if rtt: print(f"RTT ms: avg {S.mean(rtt):.3f}  p50 {pct(rtt,50):.3f}  p95 {pct(rtt,95):.3f}")
     if jit: print(f"Jitter ms: avg {S.mean(jit):.3f}")
     print(f"PDR: {pdr*100:.2f}%  ({got}/{sent})")
-PY
+# PY
+```
