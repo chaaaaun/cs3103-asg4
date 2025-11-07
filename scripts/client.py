@@ -69,10 +69,6 @@ async def run_client(protocol: str, addr, pps: int, duration_s: int, payload_len
     hudp = await HUDP().start(remote_addr=addr)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    # Client maintains its own sequence numbers
-    reliable_seq = 0
-    unreliable_seq = 0
-
     try:
         if protocol == "udp":
             await send_udp(addr, sock, pps, duration_s, payload_len)
@@ -80,6 +76,11 @@ async def run_client(protocol: str, addr, pps: int, duration_s: int, payload_len
             await send_hudp_reliable(addr, hudp, pps, duration_s, payload_len)
         elif protocol == "unreliable":
             await send_hudp_unreliable(addr, hudp, pps, duration_s, payload_len)
+        elif protocol == "hybrid":
+            await asyncio.gather(
+                send_hudp_reliable(addr, hudp, pps, duration_s, payload_len),
+                send_hudp_unreliable(addr, hudp, pps, duration_s, payload_len)
+            )
     except KeyboardInterrupt:
         print("\n[CLIENT] Interrupted")
         return
@@ -90,8 +91,8 @@ async def run_client(protocol: str, addr, pps: int, duration_s: int, payload_len
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--protocol", "-p", choices=["udp", "unreliable", "reliable"], required=True,
-                        help="udp=baseline raw, unreliable=HUDP (unreliable) reliable=HUDP (reliable)")
+    parser.add_argument("--protocol", "-p", choices=["udp", "unreliable", "reliable", "hybrid"], required=True,
+                        help="udp=baseline raw, unreliable=HUDP (unreliable) reliable=HUDP (reliable) hybrid=HUDP (mixed modes)")
     parser.add_argument("--addr", "-a", default="127.0.0.1")
     parser.add_argument("--port", "-P", type=int, default=9999)
     parser.add_argument("--pps", type=int, default=50, help="packets per second")

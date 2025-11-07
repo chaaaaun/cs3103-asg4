@@ -45,7 +45,10 @@ class HUDP:
         self._protocol: Optional[_UDPProtocol] = None
         self._recv_task: Optional[asyncio.Task] = None
         self._closed = False
-        self._metrics = Metrics(1.0, 1024)
+        self._metrics = {
+            ChannelType.RELIABLE: Metrics(1.0, 1024),
+            ChannelType.UNRELIABLE: Metrics(1.0, 1024),
+        }
         self._results = {
             ChannelType.RELIABLE: [],
             ChannelType.UNRELIABLE: [],
@@ -223,7 +226,7 @@ class HUDP:
 
     async def recv_message(self) -> HudpMessage:
         msg = await self._app_queue.get()
-        r = self._metrics.update_from_packet(msg.seq, msg.ts, msg.payload)
+        r = self._metrics[msg.channel].update_from_packet(msg.seq, msg.ts, msg.payload)
         self._results[msg.channel].append(r)
         return msg
 
