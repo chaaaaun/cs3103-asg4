@@ -103,3 +103,14 @@ sudo tc qdisc add dev lo root netem delay 500ms 50ms loss 15%
 # Restore default network conditions
 sudo tc qdisc del dev lo root
 ``` 
+
+## Extra details
+```
+To adjust the reliability ratio: go to scripts/client.py and find the line
+
+await send_hudp_random(addr, hudp, pps, duration_s, payload_len, p_reliable=0.4)
+
+you can tune the p_reliable parameter to increase or decrease the proportion of reliable packets sent by the client.
+
+A higher p_reliable ratio increase the proportion of reliable packets sent and vice versa.
+```
