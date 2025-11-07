@@ -87,7 +87,7 @@ you can tune the parameters as needed.
 5th step: If you want to generate the metrics to plot the graphs again, remove the metrics.csv file first by running the command: rm -f metrics.csv in the folder that the metrics.csv file is in. Then you can run the program from step 2 again.
 ```
 
-Network modes
+## Network modes
 ```shell
 linux environment only to simulate packet loss network conditions
 
