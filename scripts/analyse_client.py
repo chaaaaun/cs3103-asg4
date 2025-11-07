@@ -129,13 +129,12 @@ ACK_GRACE_S = 0.5
 async def run_hudp_r(addr: str, port: int, pps: int, duration_s: int, payload_len: int):
     assert HUDP is not None, "gamenetapi not available"
     udp = await HUDP().start(remote_addr=(addr, port))
-    mode = "hudp-reliable-pipelined"
+    mode = "hudp-reliable"
 
     try:
         interval = 1.0 / max(1, pps)
         t_end = time.time() + duration_s
 
-        # accounting
         sent = 0                 # actually transmitted (not locally dropped)
         acked = 0
         bytes_acked = 0
@@ -152,7 +151,7 @@ async def run_hudp_r(addr: str, port: int, pps: int, duration_s: int, payload_le
             nonlocal acked, bytes_acked, last_t, jitter, prev_rtt
             while not stop_acks.is_set():
                 try:
-                    evt = await asyncio.wait_for(udp._ack_q.get(), timeout=0.5)
+                    evt = await asyncio.wait_for(udp._ack_queue.get(), timeout=0.5)
                 except asyncio.TimeoutError:
                     continue
 
@@ -180,8 +179,8 @@ async def run_hudp_r(addr: str, port: int, pps: int, duration_s: int, payload_le
                 prev_rtt = rtt
 
                 write_row(mode=mode, event="echo_ok", seq=seq, send_ms="",
-                          recv_ms=now_ms(), rtt_ms=round(rtt, 1), bytes=payload_len,
-                          pdr=pdr, throughput_bps=throughput_bps, jitter_ms=round(jitter, 2))
+                        recv_ms=now_ms(), rtt_ms=round(rtt, 1), bytes=payload_len,
+                        pdr=pdr, throughput_bps=throughput_bps, jitter_ms=round(jitter, 2))
 
         ack_task = asyncio.create_task(ack_listener())
 

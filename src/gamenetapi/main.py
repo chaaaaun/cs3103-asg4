@@ -68,6 +68,7 @@ class HUDP:
 
         # Sender window event per address (wake blocked senders)
         self._win_event: Dict[Addr, asyncio.Event] = {}
+        self._ack_queue: asyncio.Queue = asyncio.Queue()
 
     def _get_win_event(self, addr: Addr) -> asyncio.Event:
         ev = self._win_event.get(addr)
@@ -261,7 +262,7 @@ class HUDP:
                             rtt = (time.monotonic() - entry['last_sent']) * 1000
                             print(f"[RECEIVE ACK] SeqNo={seq}, Timestamp={ts}, Retransmission #{entry['retries']}, RTT={rtt:.1f}ms from {addr}")
                         
-                        self._ack_q.put_nowait({
+                        self._ack_queue.put_nowait({
                             "addr": addr,
                             "seq": seq,
                             "rtt_ms": rtt,
